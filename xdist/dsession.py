@@ -1,6 +1,7 @@
+# encoding=utf-8
+
 import difflib
 from _pytest.runner import CollectReport
-
 import pytest
 import py
 from xdist.slavemanage import NodeManager
@@ -132,7 +133,6 @@ class EachScheduling:
             else:
                 node.send_runtest_some(pending)
             self._started.append(node)
-
 
 class LoadScheduling:
     """Implement load scheduling accross nodes.
@@ -404,35 +404,20 @@ class LoadScheduling:
 
         return same_collection
 
-
-class ClassLoadScheduling(LoadScheduling):
+class ModuleLoadScheduling(LoadScheduling):
     """Implement class-based load scheduling accross nodes.
-
     This is basically the same as LoadScheduling, except that
     we ensure that all the tests belonging to the same test class
     are executed on the same node. This is useful e.g. when your
     setUpClass()/tearDownClass() methods are time-consuming.
-
-
     Attributes:
-
     All attributes are the same than LoadScheduling.
-
-    :class_collection: The tests items, indexed by test class
+    :my_collection: The tests items, indexed by test class
     """
 
-    def __init__(self, numnodes, log=None):
-        self.numnodes = numnodes
-        self.node2collection = {}
-        self.node2pending = {}
-        self.pending = []
-        self.collection = None
-        self.class_collection = {}
-        if log is None:
-            self.log = py.log.Producer("loadsched")
-        else:
-            self.log = log.loadsched
-
+    def __init__(self, numnodes, log=None, config=None):
+        LoadScheduling.__init__(self,numnodes, log, config)
+        self.my_collection = {} # ++ add module collection 
 
     def init_distribute(self):
         """Initiate distribution of the test collection
@@ -462,14 +447,20 @@ class ClassLoadScheduling(LoadScheduling):
 
         # Collections are identical, create the index of pending items.
         self.collection = list(self.node2collection.values())[0]
+
+        # ++ add new collection logic
         for (i, test) in enumerate(self.collection):
-            parts = test.split('::')
-            test_class = parts[0] if len(parts) == 2 else parts[1]
-            if test_class in self.class_collection:
-                self.class_collection[test_class].append(i)
+            parts = test.split('::') # test example: "test_example1.py::TestClass::test_method"
+            
+            if len(parts) != 3:
+                raise Exception('can not parse test %s' %parts )
+                
+            test_class = parts[0] #TODO test_class should named test_module
+            if test_class in self.my_collection:
+                self.my_collection[test_class].append(i)
             else:
-                self.class_collection[test_class] = [i]
-        self.pending[:] = self.class_collection.keys()
+                self.my_collection[test_class] = [i]
+        self.pending[:] = self.my_collection.keys()
         if not self.collection:
             return
 
@@ -482,8 +473,8 @@ class ClassLoadScheduling(LoadScheduling):
         next = self.pending[0]
         if next:
             del self.pending[0]
-            self.node2pending[node].extend(self.class_collection[next])
-            node.send_runtest_some(self.class_collection[next])
+            self.node2pending[node].extend(self.my_collection[next])
+            node.send_runtest_some(self.my_collection[next])
 
 
 def report_collection_diff(from_collection, to_collection, from_id, to_id):
@@ -536,8 +527,13 @@ class DSession:
         self.countfailures = 0
         self.maxfail = config.getvalue("maxfail")
         self.queue = queue.Queue()
+        self._session = None
         self._failed_collection_errors = {}
         self._active_nodes = set()
+        self._failed_nodes_count = 0
+        self._max_slave_restart = self.config.getoption('max_slave_restart')
+        if self._max_slave_restart is not None:
+            self._max_slave_restart = int(self._max_slave_restart)
         try:
             self.terminal = config.pluginmanager.getplugin("terminalreporter")
         except KeyError:
@@ -569,12 +565,14 @@ class DSession:
         self.nodemanager = NodeManager(self.config)
         nodes = self.nodemanager.setup_nodes(putevent=self.queue.put)
         self._active_nodes.update(nodes)
+        self._session = session
 
     def pytest_sessionfinish(self, session):
         """Shutdown all nodes."""
         nm = getattr(self, 'nodemanager', None)  # if not fully initialized
         if nm is not None:
             nm.teardown_nodes()
+        self._session = None
 
     def pytest_collection(self):
         # prohibit collection of test items in master process
@@ -589,9 +587,8 @@ class DSession:
                                         config=self.config)
         elif dist == "each":
             self.sched = EachScheduling(numnodes, log=self.log)
-        elif dist == "class":
-
-            self.sched = ClassLoadScheduling(numnodes, log=self.log)
+        elif dist == "module":
+            self.sched = ModuleLoadScheduling(numnodes, log=self.log)
         else:
             assert 0, dist
         self.shouldstop = False
@@ -665,7 +662,19 @@ class DSession:
         else:
             if crashitem:
                 self.handle_crashitem(crashitem, node)
-        self.report_line("Replacing failed node %s" % node.gateway.id)
+
+        self._failed_nodes_count += 1
+        maximum_reached = (self._max_slave_restart is not None and
+                           self._failed_nodes_count > self._max_slave_restart)
+        if maximum_reached:
+            if self._max_slave_restart == 0:
+                msg = 'Slave restarting disabled'
+            else:
+                msg = "Maximum crashed slaves reached: %d" % \
+                      self._max_slave_restart
+            self.report_line(msg)
+        else:
+            self.report_line("Replacing crashed slave %s" % node.gateway.id)
         self._clone_node(node)
         self._active_nodes.remove(node)
 
@@ -680,6 +689,9 @@ class DSession:
         """
         if self.shuttingdown:
             return
+        # tell session which items were effectively collected otherwise
+        # the master node will finish the session with EXIT_NOTESTSCOLLECTED
+        self._session.testscollected = len(ids)
         self.sched.addnode_collection(node, ids)
         if self.terminal:
             self.trdist.setstatus(node.gateway.spec, "[%d]" % (len(ids)))
@@ -825,5 +837,11 @@ class TerminalDistReporter:
             return
         self.write_line("[%s] node down: %s" %(node.gateway.id, error))
 
-
+    #def pytest_xdist_rsyncstart(self, source, gateways):
+    #    targets = ",".join([gw.id for gw in gateways])
+    #    msg = "[%s] rsyncing: %s" %(targets, source)
+    #    self.write_line(msg)
+    #def pytest_xdist_rsyncfinish(self, source, gateways):
+    #    targets = ", ".join(["[%s]" % gw.id for gw in gateways])
+    #    self.write_line("rsyncfinish: %s -> %s" %(source, targets))
 
