@@ -1,10 +1,3 @@
-usage
-=====
-py.test /path/to/test/ --dist=module --tx=2*popen
-
-
-python module case will schedule to same subprocess, and setUpClass() will be invoked once.
-
 
 .. image:: https://travis-ci.org/pytest-dev/pytest-xdist.svg?branch=master
     :target: https://travis-ci.org/pytest-dev/pytest-xdist

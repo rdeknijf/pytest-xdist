@@ -6,7 +6,6 @@ import pytest
 import py
 from xdist.slavemanage import NodeManager
 
-
 queue = py.builtin._tryimport('queue', 'Queue')
 
 
@@ -404,37 +403,33 @@ class LoadScheduling:
 
         return same_collection
 
-class ModuleLoadScheduling(LoadScheduling):
-    """Implement class-based load scheduling accross nodes.
+
+class ClassGroupedLoadScheduling(LoadScheduling):
+    """Implement class-based load scheduling across nodes.
     This is basically the same as LoadScheduling, except that
     we ensure that all the tests belonging to the same test class
-    are executed on the same node. This is useful e.g. when your
-    setUpClass()/tearDownClass() methods are time-consuming.
+    are executed on the same node and in order. This is useful e.g. when your
+    setUpClass()/tearDownClass() methods are time-consuming or if your tests
+    depend on state, like Selenium tests a Page Object Model configuration.
+
+    This will probably be superseded by: https://github.com/pytest-dev/pytest-xdist/pull/89
+
     Attributes:
-    All attributes are the same than LoadScheduling.
-    :my_collection: The tests items, indexed by test class
+
+    :class_indexed_collection: Tests items, indexed by test class
+
+    Otherwise all attributes are identical to LoadScheduling
+
     """
 
     def __init__(self, numnodes, log=None, config=None):
-        LoadScheduling.__init__(self,numnodes, log, config)
-        self.my_collection = {} # ++ add module collection 
+        LoadScheduling.__init__(self, numnodes, log, config)
+        self.class_indexed_collection = {}  # init custom collection
 
     def init_distribute(self):
-        """Initiate distribution of the test collection
-
-        Initiate scheduling of the items across the nodes.  If this
-        gets called again later it behaves the same as calling
-        ``.check_schedule()`` on all nodes so that newly added nodes
-        will start to be used.
-
-        This is called by the ``DSession.slave_collectionfinish`` hook
-        if ``.collection_is_completed`` is True.
-
-        XXX Perhaps this method should have been called ".schedule()".
-        """
         assert self.collection_is_completed
 
-        # Initial distribution already happend, reschedule on all nodes
+        # Initial distribution already happened, reschedule on all nodes
         if self.collection is not None:
             for node in self.nodes:
                 self.check_schedule(node)
@@ -448,19 +443,19 @@ class ModuleLoadScheduling(LoadScheduling):
         # Collections are identical, create the index of pending items.
         self.collection = list(self.node2collection.values())[0]
 
-        # ++ add new collection logic
+        # Class based collection logic
         for (i, test) in enumerate(self.collection):
-            parts = test.split('::') # test example: "test_example1.py::TestClass::test_method"
-            
-            if len(parts) != 3:
-                raise Exception('can not parse test %s' %parts )
-                
-            test_class = parts[0] #TODO test_class should named test_module
-            if test_class in self.my_collection:
-                self.my_collection[test_class].append(i)
+            parts = test.split('::')  # test example: "test_example1.py::TestClass::()::test_method"
+
+            if len(parts) != 4:
+                raise Exception('Cannot parse test %s' % parts)
+
+            test_class_name = parts[1]  # e.g. str: "TestMonkeys"
+            if test_class_name in self.class_indexed_collection:
+                self.class_indexed_collection[test_class_name].append(i)
             else:
-                self.my_collection[test_class] = [i]
-        self.pending[:] = self.my_collection.keys()
+                self.class_indexed_collection[test_class_name] = [i]
+        self.pending[:] = self.class_indexed_collection.keys()
         if not self.collection:
             return
 
@@ -468,13 +463,13 @@ class ModuleLoadScheduling(LoadScheduling):
             self._send_tests(node, 1)
 
     def _send_tests(self, node, num):
-        if len(self.pending) <=0:
+        if len(self.pending) <= 0:
             return
         next = self.pending[0]
         if next:
             del self.pending[0]
-            self.node2pending[node].extend(self.my_collection[next])
-            node.send_runtest_some(self.my_collection[next])
+            self.node2pending[node].extend(self.class_indexed_collection[next])
+            node.send_runtest_some(self.class_indexed_collection[next])
 
 
 def report_collection_diff(from_collection, to_collection, from_id, to_id):
@@ -587,8 +582,8 @@ class DSession:
                                         config=self.config)
         elif dist == "each":
             self.sched = EachScheduling(numnodes, log=self.log)
-        elif dist == "module":
-            self.sched = ModuleLoadScheduling(numnodes, log=self.log)
+        elif dist == "class":
+            self.sched = ClassGroupedLoadScheduling(numnodes, log=self.log)
         else:
             assert 0, dist
         self.shouldstop = False

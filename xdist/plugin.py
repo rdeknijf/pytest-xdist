@@ -22,12 +22,12 @@ def pytest_addoption(parser):
                      help="maximum number of slaves that can be restarted "
                           "when crashed (set to zero to disable this feature)")
     group._addoption('--dist', metavar="distmode",
-           action="store", choices=['load', 'each', 'module', 'no'],
+           action="store", choices=['load', 'each', 'class', 'no'],
            type="choice", dest="dist", default="no",
            help=("set mode for distributing tests to exec environments.\n\n"
                  "each: send each test to each available environment.\n\n"
                  "load: send each test to available environment.\n\n"
-                 "module: same as 'load', but group tests by test module.\n\n"
+                 "class: load distribution grouped by class and in order.\n\n"
                  "(default) no: run tests inprocess, don't distribute."))
     group._addoption('--tx', dest="tx", action="append", default=[],
            metavar="xspec",
@@ -77,7 +77,8 @@ def pytest_configure(config):
 @pytest.mark.tryfirst
 def pytest_cmdline_main(config):
     if config.option.numprocesses:
-        config.option.dist = "load"
+        if not config.option.dist:
+            config.option.dist = "load"
         config.option.tx = ['popen'] * config.option.numprocesses
     if config.option.distload:
         config.option.dist = "load"
