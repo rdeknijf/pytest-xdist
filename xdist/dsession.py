@@ -1,7 +1,7 @@
-import difflib
-import itertools
-from _pytest.runner import CollectReport
+# encoding=utf-8
 
+import difflib
+from _pytest.runner import CollectReport
 import pytest
 import py
 from xdist.slavemanage import NodeManager
@@ -134,7 +134,6 @@ class EachScheduling:
                 node.send_runtest_some(pending)
             self._started.append(node)
 
-
 class LoadScheduling:
     """Implement load scheduling across nodes.
 
@@ -258,9 +257,8 @@ class LoadScheduling:
         assert node in self.node2pending
         if self.collection_is_completed:
             # A new node has been added later, perhaps an original one died.
-            # .init_distribute() should have
-            # been called by now
-            assert self.collection
+            assert self.collection  # .init_distribute() should have
+                                    # been called by now
             if collection != self.collection:
                 other_node = next(iter(self.node2collection.keys()))
                 msg = report_collection_diff(self.collection,
@@ -290,9 +288,6 @@ class LoadScheduling:
         ``duration`` of the last test is optionally used as a
         heuristic to influence how many tests the node is assigned.
         """
-        if node.shutting_down:
-            return
-
         if self.pending:
             # how many nodes do we have?
             num_nodes = len(self.node2pending)
@@ -367,22 +362,13 @@ class LoadScheduling:
         if not self.collection:
             return
 
-        # Send a batch of tests to run. If we don't have at least two
-        # tests per node, we have to send them all so that we can send
-        # shutdown signals and get all nodes working.
-        initial_batch = max(len(self.pending) // 4,
-                            2 * len(self.nodes))
-
-        # distribute tests round-robin up to the batch size
-        # (or until we run out)
-        nodes = itertools.cycle(self.nodes)
-        for i in range(initial_batch):
-            self._send_tests(next(nodes), 1)
-
-        if not self.pending:
-            # initial distribution sent all tests, start node shutdown
-            for node in self.nodes:
-                node.shutdown()
+        # how many items per node do we have about?
+        items_per_node = len(self.collection) // len(self.node2pending)
+        # take a fraction of tests for initial distribution
+        node_chunksize = max(items_per_node // 4, 2)
+        # and initialize each node with a chunk of tests
+        for node in self.nodes:
+            self._send_tests(node, node_chunksize)
 
     def _send_tests(self, node, num):
         tests_per_node = self.pending[:num]
@@ -412,12 +398,83 @@ class LoadScheduling:
                 same_collection = False
                 self.log(msg)
                 if self.config is not None:
-                    rep = CollectReport(
-                        node.gateway.id, 'failed',
-                        longrepr=msg, result=[])
+                    rep = CollectReport(node.gateway.id, 'failed', longrepr=msg,
+                                        result=[])
                     self.config.hook.pytest_collectreport(report=rep)
 
         return same_collection
+
+class ModuleLoadScheduling(LoadScheduling):
+    """Implement class-based load scheduling accross nodes.
+    This is basically the same as LoadScheduling, except that
+    we ensure that all the tests belonging to the same test class
+    are executed on the same node. This is useful e.g. when your
+    setUpClass()/tearDownClass() methods are time-consuming.
+    Attributes:
+    All attributes are the same than LoadScheduling.
+    :my_collection: The tests items, indexed by test class
+    """
+
+    def __init__(self, numnodes, log=None, config=None):
+        LoadScheduling.__init__(self,numnodes, log, config)
+        self.my_collection = {} # ++ add module collection 
+
+    def init_distribute(self):
+        """Initiate distribution of the test collection
+
+        Initiate scheduling of the items across the nodes.  If this
+        gets called again later it behaves the same as calling
+        ``.check_schedule()`` on all nodes so that newly added nodes
+        will start to be used.
+
+        This is called by the ``DSession.slave_collectionfinish`` hook
+        if ``.collection_is_completed`` is True.
+
+        XXX Perhaps this method should have been called ".schedule()".
+        """
+        assert self.collection_is_completed
+
+        # Initial distribution already happend, reschedule on all nodes
+        if self.collection is not None:
+            for node in self.nodes:
+                self.check_schedule(node)
+            return
+
+        # XXX allow nodes to have different collections
+        if not self._check_nodes_have_same_collection():
+            self.log('**Different tests collected, aborting run**')
+            return
+
+        # Collections are identical, create the index of pending items.
+        self.collection = list(self.node2collection.values())[0]
+
+        # ++ add new collection logic
+        for (i, test) in enumerate(self.collection):
+            parts = test.split('::') # test example: "test_example1.py::TestClass::test_method"
+            
+            if len(parts) != 3:
+                raise Exception('can not parse test %s' %parts )
+                
+            test_class = parts[0] #TODO test_class should named test_module
+            if test_class in self.my_collection:
+                self.my_collection[test_class].append(i)
+            else:
+                self.my_collection[test_class] = [i]
+        self.pending[:] = self.my_collection.keys()
+        if not self.collection:
+            return
+
+        for node in self.nodes:
+            self._send_tests(node, 1)
+
+    def _send_tests(self, node, num):
+        if len(self.pending) <=0:
+            return
+        next = self.pending[0]
+        if next:
+            del self.pending[0]
+            self.node2pending[node].extend(self.my_collection[next])
+            node.send_runtest_some(self.my_collection[next])
 
 
 def report_collection_diff(from_collection, to_collection, from_id, to_id):
@@ -524,11 +581,14 @@ class DSession:
     def pytest_runtestloop(self):
         numnodes = len(self.nodemanager.specs)
         dist = self.config.getvalue("dist")
+
         if dist == "load":
             self.sched = LoadScheduling(numnodes, log=self.log,
                                         config=self.config)
         elif dist == "each":
             self.sched = EachScheduling(numnodes, log=self.log)
+        elif dist == "module":
+            self.sched = ModuleLoadScheduling(numnodes, log=self.log)
         else:
             assert 0, dist
         self.shouldstop = False
@@ -616,7 +676,7 @@ class DSession:
             self.report_line(msg)
         else:
             self.report_line("Replacing crashed slave %s" % node.gateway.id)
-            self._clone_node(node)
+        self._clone_node(node)
         self._active_nodes.remove(node)
 
     def slave_collectionfinish(self, node, ids):
@@ -659,7 +719,7 @@ class DSession:
         """
         if rep.when == "call" or (rep.when == "setup" and not rep.passed):
             self.sched.remove_item(node, rep.item_index, rep.duration)
-        # self.report_line("testreport %s: %s" %(rep.id, rep.status))
+        #self.report_line("testreport %s: %s" %(rep.id, rep.status))
         rep.node = node
         self.config.hook.pytest_runtest_logreport(report=rep)
         self._handlefailures(rep)
@@ -738,8 +798,8 @@ class TerminalDistReporter:
             self.rewrite(self.getstatus())
 
     def getstatus(self):
-        parts = ["%s %s" % (spec.id, self._status[spec.id])
-                 for spec in self._specs]
+        parts = ["%s %s" %(spec.id, self._status[spec.id])
+                   for spec in self._specs]
         return " / ".join(parts)
 
     def rewrite(self, line, newline=False):
@@ -770,7 +830,7 @@ class TerminalDistReporter:
     def pytest_testnodeready(self, node):
         if self.config.option.verbose > 0:
             d = node.slaveinfo
-            infoline = "[%s] Python %s" % (
+            infoline = "[%s] Python %s" %(
                 d['id'],
                 d['version'].replace('\n', ' -- '),)
             self.rewrite(infoline, newline=True)
@@ -779,12 +839,13 @@ class TerminalDistReporter:
     def pytest_testnodedown(self, node, error):
         if not error:
             return
-        self.write_line("[%s] node down: %s" % (node.gateway.id, error))
+        self.write_line("[%s] node down: %s" %(node.gateway.id, error))
 
-    # def pytest_xdist_rsyncstart(self, source, gateways):
+    #def pytest_xdist_rsyncstart(self, source, gateways):
     #    targets = ",".join([gw.id for gw in gateways])
     #    msg = "[%s] rsyncing: %s" %(targets, source)
     #    self.write_line(msg)
-    # def pytest_xdist_rsyncfinish(self, source, gateways):
+    #def pytest_xdist_rsyncfinish(self, source, gateways):
     #    targets = ", ".join(["[%s]" % gw.id for gw in gateways])
     #    self.write_line("rsyncfinish: %s -> %s" %(source, targets))
+
